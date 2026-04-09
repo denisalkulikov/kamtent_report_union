@@ -561,12 +561,16 @@ def copy_cells_between_files(source_path, target_path):
                 'target': ['P31', 'P32', 'P33']
             },
             'Авто': {
-                'source': ['R5', 'R7', 'R36', 'R37', 'R38', 'R39', 'R40', 'R41', 'R42', 'R43', 'R44', 'R45', 'R74', 'R75'],
-                'target': ['Q5', 'Q7', 'Q36', 'Q37', 'Q38', 'Q39', 'Q40', 'Q41', 'Q42', 'Q43', 'Q44', 'Q45', 'Q74', 'Q75']
+                'source': ['R5', 'R7', 'R36', 'R37', 'R38', 'R39', 'R40', 'R41', 'R42', 'R43', 'R44', 'R45', 'R74',
+                           'R75'],
+                'target': ['Q5', 'Q7', 'Q36', 'Q37', 'Q38', 'Q39', 'Q40', 'Q41', 'Q42', 'Q43', 'Q44', 'Q45', 'Q74',
+                           'Q75']
             },
             'ТК': {
-                'source': ['R6', 'R7', 'R8', 'R9', 'R10', 'R11', 'R39', 'R40', 'R41', 'R42', 'R43', 'R44', 'R45', 'R46', 'R47', 'R87', 'R88'],
-                'target': ['Q6', 'Q7', 'Q8', 'Q9', 'Q10', 'Q11', 'Q39', 'Q40', 'Q41', 'Q42', 'Q43', 'Q44', 'Q45', 'Q46', 'Q47', 'Q87', 'Q88']
+                'source': ['R6', 'R7', 'R8', 'R9', 'R10', 'R11', 'R39', 'R40', 'R41', 'R42', 'R43', 'R44', 'R45', 'R46',
+                           'R47', 'R87', 'R88'],
+                'target': ['Q6', 'Q7', 'Q8', 'Q9', 'Q10', 'Q11', 'Q39', 'Q40', 'Q41', 'Q42', 'Q43', 'Q44', 'Q45', 'Q46',
+                           'Q47', 'Q87', 'Q88']
             },
             'Реклама': {
                 'source': ['R6', 'R7', 'R8', 'R9', 'R10', 'R11', 'R39', 'R40', 'R41', 'R42', 'R43', 'R70', 'R71'],
@@ -934,25 +938,73 @@ class MonthlyReportApp:
         self.realization_input = None
         self.result_container = None
 
+        # Список для отслеживания временных файлов
+        self.temp_files = []
+
     async def handle_file1_upload(self, e):
         """Обработчик загрузки первого файла (шаблон)"""
+        # Удаляем старый файл, если есть
+        if self.file1_path and os.path.exists(self.file1_path):
+            try:
+                os.unlink(self.file1_path)
+                if self.file1_path in self.temp_files:
+                    self.temp_files.remove(self.file1_path)
+            except:
+                pass
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsm') as tmp_file:
             file_content = await e.file.read()
             tmp_file.write(file_content)
             self.file1_path = tmp_file.name
+            self.temp_files.append(self.file1_path)
 
         ui.notify(f'Файл шаблона загружен: {e.file.name}', type='positive')
         print(f"Файл шаблона сохранен: {self.file1_path}")
 
     async def handle_file2_upload(self, e):
         """Обработчик загрузки второго файла (источник для копирования)"""
+        # Удаляем старый файл, если есть
+        if self.file2_path and os.path.exists(self.file2_path):
+            try:
+                os.unlink(self.file2_path)
+                if self.file2_path in self.temp_files:
+                    self.temp_files.remove(self.file2_path)
+            except:
+                pass
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsm') as tmp_file:
             file_content = await e.file.read()
             tmp_file.write(file_content)
             self.file2_path = tmp_file.name
+            self.temp_files.append(self.file2_path)
 
         ui.notify(f'Файл для копирования загружен: {e.file.name}', type='positive')
         print(f"Файл для копирования сохранен: {self.file2_path}")
+
+    def cleanup_all_temp_files(self):
+        """Удаляет все временные файлы"""
+        for file_path in self.temp_files:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.unlink(file_path)
+                    print(f"Удален временный файл: {file_path}")
+                except Exception as e:
+                    print(f"Не удалось удалить {file_path}: {e}")
+        self.temp_files.clear()
+
+        # Также удаляем файлы из temp директории, начинающиеся с "Самара"
+        temp_dir = tempfile.gettempdir()
+        try:
+            for file in os.listdir(temp_dir):
+                if file.startswith('Самара') and file.endswith('.xlsm'):
+                    file_path = os.path.join(temp_dir, file)
+                    try:
+                        os.unlink(file_path)
+                        print(f"Удален файл результата: {file_path}")
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Ошибка очистки temp: {e}")
 
     def on_data_button_click(self):
         """Обработчик нажатия кнопки получения данных"""
@@ -973,7 +1025,8 @@ class MonthlyReportApp:
         tk_sales_responsibility_data = fetch_sales_responsibility_data(selected_year, selected_month_number, 'ТК')
 
         reklama_monthly_group_data = fetch_monthly_group_products(selected_year, selected_month_number, 'РЕКЛАМА')
-        reklama_sales_responsibility_data = fetch_sales_responsibility_data(selected_year, selected_month_number, 'РЕКЛАМА')
+        reklama_sales_responsibility_data = fetch_sales_responsibility_data(selected_year, selected_month_number,
+                                                                            'РЕКЛАМА')
         reklama_total = fetch_reklama_total(selected_year, selected_month_number)
 
         angar_monthly_group_data = fetch_monthly_group_products(selected_year, selected_month_number, 'АНГАРЫ')
@@ -1053,19 +1106,22 @@ class MonthlyReportApp:
             realization_amount_value = 0
 
         client = ui.context.client
+        dialog_ref = None
+        status_label_ref = None
 
         with ui.dialog() as dialog, ui.card().classes('p-6'):
+            dialog_ref = dialog
             ui.label('Обработка файла...').classes('text-h6 mb-4')
 
             with ui.column().classes('items-center gap-4'):
-                ui.circular_progress(
+                progress_circle = ui.circular_progress(
                     value=0,
                     min=0,
                     max=100,
                     size='60px',
                     show_value=False
                 ).props('indeterminate')
-                status_label = ui.label('Подождите, файл обрабатывается...').classes('text-bold')
+                status_label_ref = ui.label('Подождите, файл обрабатывается...').classes('text-bold')
 
             dialog.open()
 
@@ -1086,27 +1142,43 @@ class MonthlyReportApp:
                         self.cached_total_shipping_sum_reklama, self.cached_total_shipping_sum_tk,
                         realization_amount_value, client, None
                     )
-                    status_label.set_text("Готово!")
+                    status_label_ref.set_text("Готово!")
+
+                    # Очищаем временные файлы через 5 секунд (после скачивания)
+                    await asyncio.sleep(5)
+                    self.cleanup_all_temp_files()
+
                     await asyncio.sleep(0.5)
                 except Exception as e:
                     with client:
                         ui.notify(f'Ошибка: {e}', type='negative')
+                    self.cleanup_all_temp_files()
                 finally:
-                    dialog.close()
+                    dialog_ref.close()
 
             asyncio.create_task(process())
 
     def cleanup_temp_files(self):
-        """Очистка старых временных файлов"""
+        """Очистка старых временных файлов при запуске"""
         temp_dir = tempfile.gettempdir()
         try:
             for file in os.listdir(temp_dir):
-                if file.startswith('Самара') and file.endswith('.xlsm'):
-                    file_path = os.path.join(temp_dir, file)
+                file_path = os.path.join(temp_dir, file)
+                # Удаляем старые временные папки
+                if os.path.isdir(file_path) and file.startswith('tmp'):
                     if os.path.getmtime(file_path) < (datetime.now() - timedelta(hours=1)).timestamp():
-                        os.remove(file_path)
+                        shutil.rmtree(file_path, ignore_errors=True)
+                        print(f"Удалена старая папка: {file_path}")
+                # Удаляем старые xlsm файлы
+                elif file.endswith('.xlsm') and (file.startswith('tmp') or file.startswith('Самара')):
+                    if os.path.getmtime(file_path) < (datetime.now() - timedelta(minutes=10)).timestamp():
+                        try:
+                            os.unlink(file_path)
+                            print(f"Удален старый файл: {file_path}")
+                        except:
+                            pass
         except Exception as e:
-            print(f"Ошибка очистки временных файлов: {e}")
+            print(f"Ошибка очистки: {e}")
 
     def create_ui(self):
         """Создание интерфейса"""
@@ -1116,16 +1188,20 @@ class MonthlyReportApp:
             with ui.row().classes('items-end gap-4'):
                 self.select_year = ui.select(options=year, value=2026, label='Выберите год').classes('w-40')
                 self.select_month = ui.select(options=month, value='Январь', label='Выберите месяц').classes('w-40')
-                self.realization_input = ui.number(label='Сумма реализации (отгрузки)', value=0, step=1000, format='%.2f').classes('w-48')
-                ui.button('Получить данные', on_click=self.on_data_button_click, icon='search').classes('bg-primary text-white')
+                self.realization_input = ui.number(label='Сумма реализации (отгрузки)', value=0, step=1000,
+                                                   format='%.2f').classes('w-48')
+                ui.button('Получить данные', on_click=self.on_data_button_click, icon='search').classes(
+                    'bg-primary text-white')
 
             ui.separator().classes('my-4')
 
             ui.label('Файлы для отчета').classes('text-h5 mb-2')
 
             with ui.row().classes('items-center gap-4'):
-                ui.upload(label='Файл-шаблон (XLSM)', on_upload=self.handle_file1_upload, auto_upload=True).classes('w-auto').props('accept=".xlsm"')
-                ui.upload(label='Файл-источник (XLSM)', on_upload=self.handle_file2_upload, auto_upload=True).classes('w-auto').props('accept=".xlsm"')
+                ui.upload(label='Файл-шаблон (XLSM)', on_upload=self.handle_file1_upload, auto_upload=True).classes(
+                    'w-auto').props('accept=".xlsm"')
+                ui.upload(label='Файл-источник (XLSM)', on_upload=self.handle_file2_upload, auto_upload=True).classes(
+                    'w-auto').props('accept=".xlsm"')
                 ui.button('Создать отчет', on_click=self.on_process_button_click, icon='description', color='positive')
 
         self.result_container = ui.column().classes('w-full')
