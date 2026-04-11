@@ -1,6 +1,6 @@
 # pages/monthly_report_page.py
 from datetime import datetime, timedelta
-
+import time
 from nicegui import ui
 from nicegui import app
 import psycopg2
@@ -635,7 +635,6 @@ def copy_cells_between_files(source_path, target_path):
         ui.notify(error_msg, type='negative')
         return None
 
-
 def process_excel_file(file1_path, file2_path, selected_month_name, selected_year,
                        directions_data, sales_data, monthly_group_data,
                        sales_responsibility_data, tk_monthly_group_data,
@@ -645,273 +644,173 @@ def process_excel_file(file1_path, file2_path, selected_month_name, selected_yea
                        kn_monthly_group_data, kn_sales_data, kn_sales_responsibility_data,
                        total_shipping_angar, total_shipping_kn, total_shipping_reklama,
                        total_shipping_tk, realization_amount_value, client, progress_callback=None):
-    """Обработка Excel файла — теперь полностью синхронная (будет запущена в thread)"""
+    """Обработка Excel файла с плавным и читаемым прогрессом"""
     output_path = None
     temp_file_path = None
+
     try:
         if progress_callback:
-            progress_callback(10, "Копирование файла-шаблона...")
+            progress_callback(5, "Копирование шаблона...")
+            time.sleep(1)
 
         temp_file_path = tempfile.mktemp(suffix='.xlsm')
         shutil.copy2(file1_path, temp_file_path)
 
         if progress_callback:
-            progress_callback(20, "Загрузка файла...")
+            progress_callback(15, "Загрузка Excel-файла...")
+            time.sleep(1)   # чуть дольше, т.к. загрузка wb может быть заметной
+
         wb = load_workbook(temp_file_path, keep_vba=True)
 
-        # 1. Обработка листа "служ"
+        # ====================== ПЛАВНЫЙ ПРОГРЕСС ======================
+        steps = [
+            (25, "Обработка служебного листа 'служ'...", "служ"),
+            (35, "Обработка титульного листа 'тит'...", "тит"),
+            (43, "Заполнение сводного листа 'общ'...", "общ"),
+            (50, "Обработка листа сегментов 'сегм'...", "сегм"),
+            (58, "Обработка листа 'Ателье'...", "Ателье"),
+            (68, "Обработка листа 'Авто'...", "Авто"),
+            (78, "Обработка листа 'ТК'...", "ТК"),
+            (85, "Обработка листа 'Реклама'...", "Реклама"),
+            (91, "Обработка листа 'Ангар'...", "Ангар"),
+            (96, "Обработка листа 'Ком'...", "Ком"),
+        ]
+
+        for percent, message, sheet_name in steps:
+            if progress_callback:
+                progress_callback(percent, message)
+                time.sleep(1)   # основная задержка — делает прогресс читаемым
+
+            # === Обработка каждого листа ===
+            if sheet_name == "служ" and "служ" in wb.sheetnames:
+                sheet_serv = wb["служ"]
+                month_number = month_to_number[selected_month_name]
+                month_nominative = month_to_nominative_lower[selected_month_name]
+                month_prepositional = month_to_prepositional[selected_month_name]
+                sheet_serv['B1'] = f"{month_nominative} "
+                sheet_serv['B2'] = f"{month_prepositional} "
+                sheet_serv['B3'] = str(month_number)
+                sheet_serv['B4'] = str(selected_year)
+
+            elif sheet_name == "тит" and "тит" in wb.sheetnames:
+                wb["тит"]['F44'] = str(selected_year)
+
+            elif sheet_name == "общ" and "общ" in wb.sheetnames:
+                sheet_obsh = wb["общ"]
+                month_number = month_to_number[selected_month_name]
+                column_letter = month_to_column[month_number]
+                direction_cells = {'ОАИ': '40', 'ТК': '41', 'АНГАРЫ': '43', 'РЕКЛАМА': '47', 'КН': '49'}
+                for direction, row in direction_cells.items():
+                    cell = f"{column_letter}{row}"
+                    amount = next((float(db_amount) for db_direction, db_amount in directions_data.items()
+                                   if str(db_direction).upper() == direction), 0.0)
+                    sheet_obsh[cell] = amount
+
+            elif sheet_name == "сегм" and "сегм" in wb.sheetnames:
+                sheet_segm = wb["сегм"]
+                month_number = month_to_number[selected_month_name]
+                column_letter = month_to_column[month_number]
+                sheet_segm[f"{column_letter}48"] = float(total_shipping_angar or 0)
+                sheet_segm[f"{column_letter}49"] = float(total_shipping_kn or 0)
+                diff = float(realization_amount_value) - float(total_shipping_angar or 0) - float(total_shipping_kn or 0)
+                sheet_segm[f"{column_letter}47"] = diff
+
+            elif sheet_name == "Ателье" and "Ателье" in wb.sheetnames:
+                sheet_atelier = wb["Ателье"]
+                sheet_atelier['Q33'] = float(total_shipping_reklama or 0)
+                sheet_atelier['Q32'] = float(total_shipping_tk or 0)
+                diff_from_segm = float(realization_amount_value) - float(total_shipping_angar or 0) - float(total_shipping_kn or 0)
+                result = diff_from_segm - float(total_shipping_reklama or 0) - float(total_shipping_tk or 0)
+                sheet_atelier['Q31'] = result
+
+            elif sheet_name == "Авто" and "Авто" in wb.sheetnames:
+                sheet_auto = wb["Авто"]
+                sheet_auto['R5'] = float(sales_data.get('РОЗНИЦА', 0) or 0)
+                sheet_auto['R7'] = float(sales_data.get('ПОТРЕБИТЕЛИ', 0) or 0)
+
+                group_product_cells = {
+                    'АВТОТЕНТЫ': 'R36', 'АВТОПОЛОГИ': 'R37', 'АВТОКАРКАСЫ': 'R38',
+                    'ВОРОТА': 'R39', 'АВТОУСЛУГИ': 'R42', 'МСК': 'R43',
+                    'РЕМОНТ': 'R44', 'ПРОЧЕЕ': 'R45'
+                }
+                for gp, cell in group_product_cells.items():
+                    sheet_auto[cell] = float(monthly_group_data.get(gp, 0) or 0)
+
+                sheet_auto['R74'] = float(sales_responsibility_data.get('СВОЯ', 0) or 0)
+                sheet_auto['R75'] = float(sales_responsibility_data.get('ЧУЖАЯ', 0) or 0)
+
+            elif sheet_name == "ТК" and "ТК" in wb.sheetnames:
+                sheet_tk = wb["ТК"]
+                # Первая группа
+                for gp, cell in {'ТОРГОВЫЕ ТК': 'R6', 'ПРОМЫШЛЕННЫЕ ТК': 'R7', 'ОРИГИНАЛЬНЫЕ ТК': 'R8',
+                                 'СПОРТИВНЫЕ И КУЛЬТ. ТК': 'R9', 'СЕЛЬСКОХОЗЯЙСТВЕННЫЕ ТК': 'R10', 'ПРОЧЕЕ': 'R11'}.items():
+                    sheet_tk[cell] = float(tk_monthly_group_data.get(gp, 0) or 0)
+
+                # Вторая группа + расчёт
+                for gp, cell in {'ТОРГОВЫЕ ТК': 'R40', 'СПОРТИВНЫЕ И КУЛЬТ. ТК': 'R41',
+                                 'ПРОМЫШЛЕННЫЕ ТК': 'R42', 'СЕЛЬСКОХОЗЯЙСТВЕННЫЕ ТК': 'R43'}.items():
+                    sheet_tk[cell] = float(tk_monthly_group_data.get(gp, 0) or 0)
+
+                original = float(tk_monthly_group_data.get('ОРИГИНАЛЬНЫЕ ТК', 0) or 0)
+                prochee = float(tk_monthly_group_data.get('ПРОЧЕЕ', 0) or 0)
+                sheet_tk['R46'] = original + prochee
+
+                sheet_tk['R87'] = float(tk_sales_responsibility_data.get('СВОЯ', 0) or 0)
+                sheet_tk['R88'] = float(tk_sales_responsibility_data.get('ЧУЖАЯ', 0) or 0)
+
+            elif sheet_name == "Реклама" and "Реклама" in wb.sheetnames:
+                sheet_reklama = wb["Реклама"]
+                for gp, cell in {'РЕКЛАМА П': 'R6', 'РЕКЛАМА Б': 'R7', 'РЕКЛАМА Т': 'R9', 'РЕКЛАМА А': 'R10'}.items():
+                    sheet_reklama[cell] = float(reklama_monthly_group_data.get(gp, 0) or 0)
+
+                sheet_reklama['R39'] = float(reklama_total or 0)
+                sheet_reklama['R70'] = float(reklama_sales_responsibility_data.get('СВОЯ', 0) or 0)
+                sheet_reklama['R71'] = float(reklama_sales_responsibility_data.get('ЧУЖАЯ', 0) or 0)
+
+            elif sheet_name == "Ангар" and "Ангар" in wb.sheetnames:
+                sheet_angar = wb["Ангар"]
+                for gp, cell in {'ПРОМЫШЛЕННОСТЬ': 'Q33', 'СЕЛЬСКОЕ ХОЗЯЙСТВО': 'Q34',
+                                 'СПОРТ И КУЛЬТУРА': 'Q35', 'ПРОЧЕЕ': 'Q36'}.items():
+                    sheet_angar[cell] = float(angar_monthly_group_data.get(gp, 0) or 0)
+
+                for gp, cell in {'ПРОМЫШЛЕННОСТЬ': 'Q6', 'СЕЛЬСКОЕ ХОЗЯЙСТВО': 'Q7',
+                                 'СПОРТ И КУЛЬТУРА': 'Q8', 'ПРОЧЕЕ': 'Q9'}.items():
+                    sheet_angar[cell] = float(angar_sales_data.get(gp, 0) or 0)
+
+            elif sheet_name == "Ком" and "Ком" in wb.sheetnames:
+                sheet_kn = wb["Ком"]
+                for gp, cell in {'ТКАНИ': 'R6', 'ФУРНИТУРА': 'R7', 'ПРОЧЕЕ': 'R8'}.items():
+                    sheet_kn[cell] = float(kn_monthly_group_data.get(gp, 0) or 0)
+
+                sheet_kn['R29'] = float(kn_sales_data.get('РОЗНИЦА', 0) or 0)
+                sheet_kn['R31'] = float(kn_sales_data.get('ПОТРЕБИТЕЛИ', 0) or 0)
+                sheet_kn['R58'] = float(kn_sales_responsibility_data.get('СВОЯ', 0) or 0)
+                sheet_kn['R59'] = float(kn_sales_responsibility_data.get('ЧУЖАЯ', 0) or 0)
+
+        # Финальное сохранение
         if progress_callback:
-            progress_callback(25, "Обработка листа 'служ'...")
-        if "служ" in wb.sheetnames:
-            sheet_serv = wb["служ"]
-            month_number = month_to_number[selected_month_name]
-            month_nominative = month_to_nominative_lower[selected_month_name]
-            month_prepositional = month_to_prepositional[selected_month_name]
+            progress_callback(98, "Сохранение файла...")
+            time.sleep(1)
 
-            sheet_serv['B1'] = f"{month_nominative} "
-            sheet_serv['B2'] = f"{month_prepositional} "
-            sheet_serv['B3'] = str(month_number)
-            sheet_serv['B4'] = str(selected_year)
-        else:
-            print('Лист "служ" не найден в файле')
-
-        # 2. Обработка листа "тит"
-        if progress_callback:
-            progress_callback(30, "Обработка листа 'тит'...")
-        if "тит" in wb.sheetnames:
-            sheet_tit = wb["тит"]
-            sheet_tit['F44'] = str(selected_year)
-        else:
-            print('Лист "тит" не найден в файле')
-
-        # 3. Обработка листа "общ"
-        if progress_callback:
-            progress_callback(35, "Обработка листа 'общ'...")
-        if "общ" in wb.sheetnames:
-            sheet_obsh = wb["общ"]
-            month_number = month_to_number[selected_month_name]
-            column_letter = month_to_column[month_number]
-
-            direction_cells = {'ОАИ': '40', 'ТК': '41', 'АНГАРЫ': '43', 'РЕКЛАМА': '47', 'КН': '49'}
-
-            for direction, row in direction_cells.items():
-                cell = f"{column_letter}{row}"
-                amount = 0
-                for db_direction, db_amount in directions_data.items():
-                    if db_direction.upper() == direction:
-                        amount = float(db_amount) if db_amount else 0
-                        break
-                sheet_obsh[cell] = amount
-                print(f"Записываю в ячейку {cell} сумму: {amount}")
-        else:
-            print('Лист "общ" не найден в файле')
-
-        # 4. Обработка листа "сегм"
-        if progress_callback:
-            progress_callback(45, "Обработка листа 'сегм'...")
-        if "сегм" in wb.sheetnames:
-            sheet_segm = wb["сегм"]
-            month_number = month_to_number[selected_month_name]
-            column_letter = month_to_column[month_number]
-
-            cell_angar = f"{column_letter}48"
-            sheet_segm[cell_angar] = float(total_shipping_angar) if total_shipping_angar else 0
-            print(f"Записываю в ячейку {cell_angar} (shipping_sum АНГАРЫ) сумму: {total_shipping_angar}")
-
-            cell_kn = f"{column_letter}49"
-            sheet_segm[cell_kn] = float(total_shipping_kn) if total_shipping_kn else 0
-            print(f"Записываю в ячейку {cell_kn} (shipping_sum КН) сумму: {total_shipping_kn}")
-
-            difference = float(realization_amount_value) - float(total_shipping_angar) - float(total_shipping_kn)
-            cell_diff = f"{column_letter}47"
-            sheet_segm[cell_diff] = difference if difference else 0
-            print(f"Записываю в ячейку {cell_diff} (разница) сумму: {difference}")
-        else:
-            print('Лист "сегм" не найден в файле')
-
-        # 5. Обработка листа "Ателье"
-        if progress_callback:
-            progress_callback(55, "Обработка листа 'Ателье'...")
-        if "Ателье" in wb.sheetnames:
-            sheet_atelier = wb["Ателье"]
-
-            sheet_atelier['Q33'] = float(total_shipping_reklama) if total_shipping_reklama else 0
-            print(f"Записываю в ячейку Q33 (shipping_sum РЕКЛАМА) сумму: {total_shipping_reklama}")
-
-            sheet_atelier['Q32'] = float(total_shipping_tk) if total_shipping_tk else 0
-            print(f"Записываю в ячейку Q32 (shipping_sum ТК) сумму: {total_shipping_tk}")
-
-            diff_from_segm = float(realization_amount_value) - float(total_shipping_angar) - float(total_shipping_kn)
-            result = diff_from_segm - float(total_shipping_reklama) - float(total_shipping_tk)
-            sheet_atelier['Q31'] = result if result else 0
-            print(f"Записываю в ячейку Q31 (результат) сумму: {result}")
-        else:
-            print('Лист "Ателье" не найден в файле')
-
-        # 6. Обработка листа "Авто"
-        if progress_callback:
-            progress_callback(65, "Обработка листа 'Авто'...")
-        if "Авто" in wb.sheetnames:
-            sheet_auto = wb["Авто"]
-
-            roznica_amount = sales_data.get('РОЗНИЦА', 0)
-            potrebiteli_amount = sales_data.get('ПОТРЕБИТЕЛИ', 0)
-
-            sheet_auto['R5'] = float(roznica_amount) if roznica_amount else 0
-            sheet_auto['R7'] = float(potrebiteli_amount) if potrebiteli_amount else 0
-
-            group_product_cells = {
-                'АВТОТЕНТЫ': 'R36', 'АВТОПОЛОГИ': 'R37', 'АВТОКАРКАСЫ': 'R38',
-                'ВОРОТА': 'R39', 'АВТОУСЛУГИ': 'R42', 'МСК': 'R43', 'РЕМОНТ': 'R44', 'ПРОЧЕЕ': 'R45'
-            }
-
-            for group_product, cell in group_product_cells.items():
-                amount = monthly_group_data.get(group_product, 0)
-                sheet_auto[cell] = float(amount) if amount else 0
-
-            svoya_amount = sales_responsibility_data.get('СВОЯ', 0)
-            chuzhaya_amount = sales_responsibility_data.get('ЧУЖАЯ', 0)
-
-            sheet_auto['R74'] = float(svoya_amount) if svoya_amount else 0
-            sheet_auto['R75'] = float(chuzhaya_amount) if chuzhaya_amount else 0
-        else:
-            print('Лист "Авто" не найден в файле')
-
-        # 7. Обработка листа "ТК"
-        if progress_callback:
-            progress_callback(75, "Обработка листа 'ТК'...")
-        if "ТК" in wb.sheetnames:
-            sheet_tk = wb["ТК"]
-
-            tk_group_cells_1 = {
-                'ТОРГОВЫЕ ТК': 'R6', 'ПРОМЫШЛЕННЫЕ ТК': 'R7', 'ОРИГИНАЛЬНЫЕ ТК': 'R8',
-                'СПОРТИВНЫЕ И КУЛЬТ. ТК': 'R9', 'СЕЛЬСКОХОЗЯЙСТВЕННЫЕ ТК': 'R10', 'ПРОЧЕЕ': 'R11'
-            }
-
-            for group_product, cell in tk_group_cells_1.items():
-                amount = tk_monthly_group_data.get(group_product, 0)
-                sheet_tk[cell] = float(amount) if amount else 0
-
-            tk_group_cells_2 = {
-                'ТОРГОВЫЕ ТК': 'R40', 'СПОРТИВНЫЕ И КУЛЬТ. ТК': 'R41',
-                'ПРОМЫШЛЕННЫЕ ТК': 'R42', 'СЕЛЬСКОХОЗЯЙСТВЕННЫЕ ТК': 'R43'
-            }
-
-            for group_product, cell in tk_group_cells_2.items():
-                amount = tk_monthly_group_data.get(group_product, 0)
-                sheet_tk[cell] = float(amount) if amount else 0
-
-            original_amount = tk_monthly_group_data.get('ОРИГИНАЛЬНЫЕ ТК', 0)
-            prochee_amount = tk_monthly_group_data.get('ПРОЧЕЕ', 0)
-            sheet_tk['R46'] = float(original_amount) + float(prochee_amount)
-
-            tk_svoya_amount = tk_sales_responsibility_data.get('СВОЯ', 0)
-            tk_chuzhaya_amount = tk_sales_responsibility_data.get('ЧУЖАЯ', 0)
-
-            sheet_tk['R87'] = float(tk_svoya_amount) if tk_svoya_amount else 0
-            sheet_tk['R88'] = float(tk_chuzhaya_amount) if tk_chuzhaya_amount else 0
-        else:
-            print('Лист "ТК" не найден в файле')
-
-        # 8. Обработка листа "Реклама"
-        if progress_callback:
-            progress_callback(85, "Обработка листа 'Реклама'...")
-        if "Реклама" in wb.sheetnames:
-            sheet_reklama = wb["Реклама"]
-
-            reklama_cells = {
-                'РЕКЛАМА П': 'R6', 'РЕКЛАМА Б': 'R7', 'РЕКЛАМА Т': 'R9', 'РЕКЛАМА А': 'R10'
-            }
-
-            for group_product, cell in reklama_cells.items():
-                amount = reklama_monthly_group_data.get(group_product, 0)
-                sheet_reklama[cell] = float(amount) if amount else 0
-
-            sheet_reklama['R39'] = float(reklama_total) if reklama_total else 0
-
-            reklama_svoya_amount = reklama_sales_responsibility_data.get('СВОЯ', 0)
-            reklama_chuzhaya_amount = reklama_sales_responsibility_data.get('ЧУЖАЯ', 0)
-
-            sheet_reklama['R70'] = float(reklama_svoya_amount) if reklama_svoya_amount else 0
-            sheet_reklama['R71'] = float(reklama_chuzhaya_amount) if reklama_chuzhaya_amount else 0
-        else:
-            print('Лист "Реклама" не найден в файле')
-
-        # 9. Обработка листа "Ангар"
-        if progress_callback:
-            progress_callback(90, "Обработка листа 'Ангар'...")
-        if "Ангар" in wb.sheetnames:
-            sheet_angar = wb["Ангар"]
-
-            angar_monthly_cells = {
-                'ПРОМЫШЛЕННОСТЬ': 'Q33', 'СЕЛЬСКОЕ ХОЗЯЙСТВО': 'Q34',
-                'СПОРТ И КУЛЬТУРА': 'Q35', 'ПРОЧЕЕ': 'Q36'
-            }
-
-            for group_product, cell in angar_monthly_cells.items():
-                amount = angar_monthly_group_data.get(group_product, 0)
-                sheet_angar[cell] = float(amount) if amount else 0
-
-            angar_sales_cells = {
-                'ПРОМЫШЛЕННОСТЬ': 'Q6', 'СЕЛЬСКОЕ ХОЗЯЙСТВО': 'Q7',
-                'СПОРТ И КУЛЬТУРА': 'Q8', 'ПРОЧЕЕ': 'Q9'
-            }
-
-            for group_product, cell in angar_sales_cells.items():
-                amount = angar_sales_data.get(group_product, 0)
-                sheet_angar[cell] = float(amount) if amount else 0
-        else:
-            print('Лист "Ангар" не найден в файле')
-
-        # 10. Обработка листа "Ком"
-        if progress_callback:
-            progress_callback(95, "Обработка листа 'Ком'...")
-        if "Ком" in wb.sheetnames:
-            sheet_kn = wb["Ком"]
-
-            kn_monthly_cells = {
-                'ТКАНИ': 'R6', 'ФУРНИТУРА': 'R7', 'ПРОЧЕЕ': 'R8'
-            }
-
-            for group_product, cell in kn_monthly_cells.items():
-                amount = kn_monthly_group_data.get(group_product, 0)
-                sheet_kn[cell] = float(amount) if amount else 0
-
-            kn_roznica_amount = kn_sales_data.get('РОЗНИЦА', 0)
-            kn_potrebiteli_amount = kn_sales_data.get('ПОТРЕБИТЕЛИ', 0)
-
-            sheet_kn['R29'] = float(kn_roznica_amount) if kn_roznica_amount else 0
-            sheet_kn['R31'] = float(kn_potrebiteli_amount) if kn_potrebiteli_amount else 0
-
-            kn_svoya_amount = kn_sales_responsibility_data.get('СВОЯ', 0)
-            kn_chuzhaya_amount = kn_sales_responsibility_data.get('ЧУЖАЯ', 0)
-
-            sheet_kn['R58'] = float(kn_svoya_amount) if kn_svoya_amount else 0
-            sheet_kn['R59'] = float(kn_chuzhaya_amount) if kn_chuzhaya_amount else 0
-        else:
-            print('Лист "Ком" не найден в файле')
-
-        # Сохраняем изменения
-        if progress_callback:
-            progress_callback(97, "Сохранение файла...")
         month_number = month_to_number[selected_month_name]
         output_filename = f"Самара {month_number} Отчет {selected_year} {selected_month_name}.xlsm"
         output_path = os.path.join(tempfile.gettempdir(), output_filename)
+
         wb.save(output_path)
         wb.close()
 
-        # Копирование из file2
         if progress_callback:
-            progress_callback(98, "Копирование данных из второго файла...")
+            progress_callback(99, "Копирование данных из второго файла...")
+
         if file2_path and os.path.exists(file2_path):
             final_path = copy_cells_between_files(file2_path, output_path)
             if final_path:
                 output_path = final_path
 
         if progress_callback:
-            progress_callback(100, "Готово!")
+            progress_callback(100, "Отчёт успешно сформирован!")
 
-        return output_path  # ← возвращаем путь, не делаем notify/download здесь
+        return output_path
 
     except Exception as e:
         print(f'Ошибка при обработке файла: {e}')
@@ -919,6 +818,7 @@ def process_excel_file(file1_path, file2_path, selected_month_name, selected_yea
         if progress_callback:
             progress_callback(100, f"Ошибка: {str(e)[:100]}...")
         return None
+
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             try:
@@ -1173,7 +1073,7 @@ class MonthlyReportApp:
                     status_label.set_text("Файл отправлен на скачивание...")
                     progress_circle.set_value(100)
 
-                    await asyncio.sleep(5)   # даём браузеру время скачать
+                    await asyncio.sleep(3)   # даём браузеру время скачать
 
                 else:
                     with client:
