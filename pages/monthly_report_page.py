@@ -1,18 +1,27 @@
 # pages/monthly_report_page.py
-import time
 from datetime import datetime, timedelta
 
 from nicegui import ui
+from nicegui import app
 import psycopg2
 from dotenv import load_dotenv
 import os
 import warnings
-import openpyxl
 from openpyxl import load_workbook
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import traceback
+
 import shutil
+from pathlib import Path
+
+# Папка для скачиваемых отчётов (создаётся автоматически)
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "nicegui_downloads"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# Регистрируем папку как статическую для NiceGUI
+app.add_static_files('/downloads', str(DOWNLOAD_DIR))
 
 load_dotenv()
 
@@ -89,6 +98,15 @@ month_to_column = {
     7: 'H', 8: 'I', 9: 'J', 10: 'K', 11: 'L', 12: 'M'
 }
 
+# Глобальный обработчик для уведомлений из JS (один раз на приложение)
+@app.on_event('startup')
+def setup_notification_handler():
+    @ui.on('show_notification')
+    def handle_notification(e):
+        data = e.args.get('detail', {}) if hasattr(e, 'args') else {}
+        msg = data.get('message', 'Готово')
+        ntype = data.get('type', 'info')
+        ui.notify(msg, type=ntype)
 
 def get_db_connection():
     """Создание подключения к БД"""
@@ -627,12 +645,13 @@ def process_excel_file(file1_path, file2_path, selected_month_name, selected_yea
                        kn_monthly_group_data, kn_sales_data, kn_sales_responsibility_data,
                        total_shipping_angar, total_shipping_kn, total_shipping_reklama,
                        total_shipping_tk, realization_amount_value, client, progress_callback=None):
-    """Обработка Excel файла"""
+    """Обработка Excel файла — теперь полностью синхронная (будет запущена в thread)"""
     output_path = None
     temp_file_path = None
     try:
         if progress_callback:
             progress_callback(10, "Копирование файла-шаблона...")
+
         temp_file_path = tempfile.mktemp(suffix='.xlsm')
         shutil.copy2(file1_path, temp_file_path)
 
@@ -877,12 +896,11 @@ def process_excel_file(file1_path, file2_path, selected_month_name, selected_yea
             progress_callback(97, "Сохранение файла...")
         month_number = month_to_number[selected_month_name]
         output_filename = f"Самара {month_number} Отчет {selected_year} {selected_month_name}.xlsm"
-        temp_dir = tempfile.gettempdir()
-        output_path = os.path.join(temp_dir, output_filename)
+        output_path = os.path.join(tempfile.gettempdir(), output_filename)
         wb.save(output_path)
         wb.close()
 
-        # Копируем значения из второго файла в первый
+        # Копирование из file2
         if progress_callback:
             progress_callback(98, "Копирование данных из второго файла...")
         if file2_path and os.path.exists(file2_path):
@@ -893,14 +911,14 @@ def process_excel_file(file1_path, file2_path, selected_month_name, selected_yea
         if progress_callback:
             progress_callback(100, "Готово!")
 
-        with client:
-            ui.notify(f'Файл успешно создан: {os.path.basename(output_path)}', type='positive')
-            ui.download(output_path)
+        return output_path  # ← возвращаем путь, не делаем notify/download здесь
 
     except Exception as e:
-        with client:
-            ui.notify(f'Ошибка при обработке файла: {e}', type='negative')
+        print(f'Ошибка при обработке файла: {e}')
         print(traceback.format_exc())
+        if progress_callback:
+            progress_callback(100, f"Ошибка: {str(e)[:100]}...")
+        return None
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             try:
@@ -1088,48 +1106,43 @@ class MonthlyReportApp:
         self.current_results_container = self.result_container
 
     def on_process_button_click(self):
-        """Обработчик нажатия кнопки обработки"""
         if not self.file1_path:
             ui.notify('Сначала загрузите файл шаблона', type='warning')
             return
-
         if not self.cached_data:
-            ui.notify('Сначала получите данные из БД (кнопка "Получить данные")', type='warning')
+            ui.notify('Сначала получите данные из БД', type='warning')
             return
 
         selected_year = self.select_year.value
         selected_month_name = self.select_month.value
 
         try:
-            realization_amount_value = float(self.realization_input.value) if self.realization_input.value else 0
+            realization_amount_value = float(self.realization_input.value or 0)
         except (ValueError, TypeError):
             realization_amount_value = 0
 
         client = ui.context.client
-        dialog_ref = None
-        status_label_ref = None
 
-        with ui.dialog() as dialog, ui.card().classes('p-6'):
-            dialog_ref = dialog
-            ui.label('Обработка файла...').classes('text-h6 mb-4')
+        with ui.dialog() as dialog, ui.card().classes('p-6 w-96'):
+            ui.label('Обработка отчёта...').classes('text-h6 mb-4')
+            progress_circle = ui.circular_progress(value=0, min=0, max=100, size='70px', show_value=True)
+            status_label = ui.label('Подготовка...').classes('text-bold')
 
-            with ui.column().classes('items-center gap-4'):
-                progress_circle = ui.circular_progress(
-                    value=0,
-                    min=0,
-                    max=100,
-                    size='60px',
-                    show_value=False
-                ).props('indeterminate')
-                status_label_ref = ui.label('Подождите, файл обрабатывается...').classes('text-bold')
+        dialog.open()
 
-            dialog.open()
+        async def run_processing():
+            def progress_callback(percent: int, message: str):
+                progress_circle.set_value(percent)
+                status_label.set_text(message)
 
-            async def process():
-                await asyncio.sleep(0.1)
+            output_path = None
+            download_url = None
 
-                try:
-                    process_excel_file(
+            try:
+                loop = asyncio.get_running_loop()
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    output_path = await loop.run_in_executor(
+                        executor, process_excel_file,
                         self.file1_path, self.file2_path, selected_month_name, selected_year,
                         self.cached_data, self.cached_sales_data, self.cached_monthly_group_data,
                         self.cached_sales_responsibility_data, self.cached_tk_monthly_group_data,
@@ -1140,23 +1153,43 @@ class MonthlyReportApp:
                         self.cached_kn_sales_responsibility_data,
                         self.cached_total_shipping_sum_angar, self.cached_total_shipping_sum_kn,
                         self.cached_total_shipping_sum_reklama, self.cached_total_shipping_sum_tk,
-                        realization_amount_value, client, None
+                        realization_amount_value, client, progress_callback
                     )
-                    status_label_ref.set_text("Готово!")
 
-                    # Очищаем временные файлы через 5 секунд (после скачивания)
-                    await asyncio.sleep(5)
-                    self.cleanup_all_temp_files()
+                if output_path and os.path.exists(output_path):
+                    filename = os.path.basename(output_path)
 
-                    await asyncio.sleep(0.5)
-                except Exception as e:
+                    # Копируем файл в статическую папку NiceGUI
+                    target_path = DOWNLOAD_DIR / filename
+                    shutil.copy2(output_path, target_path)
+
+                    download_url = f"/downloads/{filename}"
+
                     with client:
-                        ui.notify(f'Ошибка: {e}', type='negative')
-                    self.cleanup_all_temp_files()
-                finally:
-                    dialog_ref.close()
+                        ui.notify(f'Файл готов: {filename}', type='positive')
+                        # Самый надёжный способ — открыть ссылку с атрибутом download
+                        ui.download(download_url, filename=filename)
 
-            asyncio.create_task(process())
+                    status_label.set_text("Файл отправлен на скачивание...")
+                    progress_circle.set_value(100)
+
+                    await asyncio.sleep(5)   # даём браузеру время скачать
+
+                else:
+                    with client:
+                        ui.notify('Не удалось создать файл', type='negative')
+
+            except Exception as e:
+                print(f"Ошибка: {e}")
+                print(traceback.format_exc())
+                with client:
+                    ui.notify(f'Ошибка: {str(e)[:150]}', type='negative')
+            finally:
+                await asyncio.sleep(8)   # увеличенная задержка — файл уже должен быть скачан
+                self.cleanup_all_temp_files()
+                dialog.close()
+
+        asyncio.create_task(run_processing())
 
     def cleanup_temp_files(self):
         """Очистка старых временных файлов при запуске"""

@@ -33,6 +33,7 @@ def main_page():
 if __name__ == "__main__":
     ui.run(
         title="Объединенные отчеты и инструменты",
+        reconnect_timeout=120,
         favicon="🚀",
         port=8001,
         reload=False
