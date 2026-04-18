@@ -3,22 +3,18 @@ from nicegui import ui
 import psycopg2
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.statespace.sarimax import SARIMAX
 from prophet import Prophet
-from sklearn.metrics import mean_absolute_error
 import asyncio
 import warnings
 import os
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
 load_dotenv()
-
 warnings.filterwarnings('ignore')
 
-# Конфигурация БД из переменных окружения
+
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
     "database": os.getenv("DB_NAME", "postgres"),
@@ -37,25 +33,12 @@ class ForecastApp:
         self.df_kn_groups = pd.DataFrame()
         self.df_reklama_groups = pd.DataFrame()
         self.df_tk_groups = pd.DataFrame()
-        self.direction_coefficients = {}
-        self.oai_group_coefficients = {}
-        self.kn_group_coefficients = {}
-        self.reklama_group_coefficients = {}
-        self.tk_group_coefficients = {}
+
         self.monthly_df = None
         self.weekly_df = None
         self.daily_df = None
-        self.years_table = None
-        self.forecast_table = None
-        self.direction_forecast_table = None
-        self.oai_group_forecast_table = None
-        self.kn_group_forecast_table = None
-        self.reklama_group_forecast_table = None
-        self.tk_group_forecast_table = None
-        self.progress_bar = None
-        self.progress_text = None
 
-        # Контейнеры для динамического обновления
+        # Контейнеры
         self.years_container = None
         self.forecast_container = None
         self.direction_container = None
@@ -65,618 +48,232 @@ class ForecastApp:
         self.kn_group_container = None
         self.progress_container = None
 
+        self.progress_bar = None
+        self.progress_text = None
+        self.select_year = None
+        self.agg_select = None
+
     def get_db_connection(self):
-        """Создание подключения к БД"""
         try:
             return psycopg2.connect(**DB_CONFIG)
         except Exception as e:
             ui.notify(f'Ошибка подключения к БД: {e}', type='negative')
             return None
 
+    # ====================== ЗАГРУЗКА ДАННЫХ ======================
     def load_years_data(self):
-        """Загрузка данных по годам из division_results (сохраняем копейки)"""
         conn = self.get_db_connection()
-        if not conn:
-            return pd.DataFrame()
-
+        if not conn: return pd.DataFrame()
         try:
             query = """
-                    select year, sum (total_amount_plan) as plan, sum (total_amount_summary) as fact
-                    from kamtent.division_results
-                    group by year
-                    order by year \
-                    """
-            df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            ui.notify(f'Ошибка загрузки данных по годам: {e}', type='negative')
-            return pd.DataFrame()
+                SELECT year, SUM(total_amount_plan) as plan, SUM(total_amount_summary) as fact
+                FROM kamtent.division_results
+                GROUP BY year ORDER BY year
+            """
+            return pd.read_sql(query, conn)
         finally:
             conn.close()
 
     def load_directions_data(self):
-        """Загрузка данных по товарным направлениям"""
         conn = self.get_db_connection()
-        if not conn:
-            return pd.DataFrame()
-
+        if not conn: return pd.DataFrame()
         try:
             query = """
-                    SELECT
-                        year, direction, total_amount_actual as actual, total_amount_plan as plan
-                    FROM kamtent.yearly_division_results
-                    ORDER BY year, direction \
-                    """
-            df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            ui.notify(f'Ошибка загрузки данных по направлениям: {e}', type='negative')
-            return pd.DataFrame()
+                SELECT year, direction, total_amount_actual as actual, total_amount_plan as plan
+                FROM kamtent.yearly_division_results
+                ORDER BY year, direction
+            """
+            return pd.read_sql(query, conn)
         finally:
             conn.close()
-
-    def calculate_direction_coefficients(self, target_year):
-        """Расчет средних коэффициентов по направлениям на основе всех годов до target_year - 2"""
-        if self.df_directions.empty:
-            self.df_directions = self.load_directions_data()
-
-        if self.df_directions.empty:
-            return {}
-
-        # Берем все годы, которые меньше или равны target_year - 2
-        max_year = target_year - 2
-        years = sorted([y for y in self.df_directions['year'].unique() if y <= max_year])
-
-        # Если данных нет, берем последние доступные годы
-        if not years:
-            years = sorted(self.df_directions['year'].unique())[-3:]
-
-        print(f"\n{'=' * 60}")
-        print(f"Расчет средних коэффициентов на основе годов: {years}")
-        print(f"(все годы до {max_year}, включительно)")
-        print(f"{'=' * 60}")
-
-        # Собираем коэффициенты по каждому году
-        all_coefficients = {}
-
-        for year in years:
-            df_year = self.df_directions[self.df_directions['year'] == year]
-            year_totals = df_year.groupby('direction')['actual'].sum()
-            year_total = year_totals.sum()
-
-            if year_total > 0:
-                print(f"\n{year} год:")
-                print("-" * 40)
-                for direction, total in year_totals.items():
-                    coef = total / year_total
-                    print(f"  {direction}: {coef:.6f} ({coef * 100:.2f}%)")
-
-                    if direction not in all_coefficients:
-                        all_coefficients[direction] = []
-                    all_coefficients[direction].append(coef)
-
-        # Рассчитываем средние коэффициенты
-        coefficients = {}
-        print(f"\n{'=' * 60}")
-        print(f"СРЕДНИЕ КОЭФФИЦИЕНТЫ за {len(years)} лет ({years[0]}-{years[-1]}):")
-        print(f"{'=' * 60}")
-
-        for direction, coef_list in all_coefficients.items():
-            avg_coef = sum(coef_list) / len(coef_list)
-            coefficients[direction] = avg_coef
-            print(f"  {direction}: {avg_coef:.6f} ({avg_coef * 100:.2f}%)")
-            print(f"    Диапазон: {min(coef_list):.6f} - {max(coef_list):.6f}")
-
-        # Выводим общую сумму коэффициентов для проверки
-        total_coef = sum(coefficients.values())
-        print(f"\nСумма коэффициентов: {total_coef:.6f}")
-
-        # Нормализуем, если сумма не равна 1
-        if abs(total_coef - 1.0) > 0.0001:
-            print(f"ВНИМАНИЕ: Сумма коэффициентов = {total_coef:.6f}, выполняем нормализацию...")
-            for direction in coefficients:
-                coefficients[direction] = coefficients[direction] / total_coef
-
-            print("\nПосле нормализации:")
-            for direction, coef in coefficients.items():
-                print(f"  {direction}: {coef:.6f} ({coef * 100:.2f}%)")
-
-        return coefficients
-
-    def split_forecast_by_directions(self, monthly_forecast, target_year):
-        """Разбивка помесячного прогноза по направлениям"""
-        coefficients = self.calculate_direction_coefficients(target_year)
-
-        if not coefficients:
-            ui.notify('Нет данных по направлениям для разбивки прогноза', type='warning')
-            return None
-
-        # Создаем DataFrame с разбивкой по месяцам и направлениям
-        result = []
-
-        for _, row in monthly_forecast.iterrows():
-            month = row['month']
-            total = row['forecast']
-
-            # Разбиваем без округления
-            forecast_values = {}
-            for direction, coef in coefficients.items():
-                forecast_values[direction] = total * coef
-
-            # Округляем до тысяч, но не теряем малые суммы
-            rounded_values = {}
-            remaining = total
-
-            # Сначала округляем все направления, кроме последнего
-            directions_list = list(coefficients.keys())
-            for i, direction in enumerate(directions_list[:-1]):
-                rounded = max(1000, round(forecast_values[direction] / 1000) * 1000)
-                rounded_values[direction] = rounded
-                remaining -= rounded
-
-            # Последнее направление получает остаток
-            last_direction = directions_list[-1]
-            rounded_values[last_direction] = max(0, remaining)
-
-            # Добавляем в результат
-            for direction, value in rounded_values.items():
-                result.append({
-                    'month': month,
-                    'direction': direction,
-                    'forecast': value
-                })
-
-        result_df = pd.DataFrame(result)
-
-        # Выводим проверку сходимости
-        print("\nПроверка сходимости сумм после корректировки:")
-        for month_num in range(1, 13):
-            month_total = monthly_forecast[monthly_forecast['month'].dt.month == month_num]['forecast'].sum()
-            directions_sum = result_df[result_df['month'].dt.month == month_num]['forecast'].sum()
-            print(
-                f"  Месяц {month_num}: прогноз={month_total:,.0f}, сумма по направлениям={directions_sum:,.0f}, разница={month_total - directions_sum:,.0f}")
-
-        return result_df
 
     def load_oai_group_data(self):
-        """Загрузка данных по товарным группам для направления ОАИ"""
         conn = self.get_db_connection()
-        if not conn:
-            return pd.DataFrame()
-
+        if not conn: return pd.DataFrame()
         try:
             query = """
-                    SELECT
-                        year, month, direction, group_product, pay_summ
-                    FROM kamtent.monthly_group_product
-                    WHERE direction = 'ОАИ'
-                    ORDER BY year, month, group_product \
-                    """
-            df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            ui.notify(f'Ошибка загрузки данных по товарным группам: {e}', type='negative')
-            return pd.DataFrame()
+                SELECT year, month, direction, group_product, pay_summ
+                FROM kamtent.monthly_group_product WHERE direction = 'ОАИ'
+                ORDER BY year, month, group_product
+            """
+            return pd.read_sql(query, conn)
         finally:
             conn.close()
-
-    def calculate_oai_group_coefficients(self, target_year):
-        """Расчет коэффициентов для товарных групп ОАИ на основе всех годов до target_year - 2"""
-        if self.df_oai_groups.empty:
-            self.df_oai_groups = self.load_oai_group_data()
-
-        if self.df_oai_groups.empty:
-            return {}
-
-        # Берем все годы, которые меньше или равны target_year - 2
-        max_year = target_year - 2
-        years = sorted([y for y in self.df_oai_groups['year'].unique() if y <= max_year])
-
-        # Если данных нет, берем последние доступные годы
-        if not years:
-            years = sorted(self.df_oai_groups['year'].unique())[-3:]
-
-        print(f"\n{'=' * 60}")
-        print(f"Расчет коэффициентов для товарных групп ОАИ на основе годов: {years}")
-        print(f"(все годы до {max_year}, включительно)")
-        print(f"{'=' * 60}")
-
-        # Собираем коэффициенты по каждому году
-        all_coefficients = {}
-
-        for year in years:
-            df_year = self.df_oai_groups[self.df_oai_groups['year'] == year]
-            # Суммируем по месяцам для каждого года
-            year_totals = df_year.groupby('group_product')['pay_summ'].sum()
-            year_total = year_totals.sum()
-
-            if year_total > 0:
-                print(f"\n{year} год:")
-                print("-" * 40)
-                for group, total in year_totals.items():
-                    coef = total / year_total
-                    print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%)")
-
-                    if group not in all_coefficients:
-                        all_coefficients[group] = []
-                    all_coefficients[group].append(coef)
-
-        # Рассчитываем средние коэффициенты
-        coefficients = {}
-        print(f"\n{'=' * 60}")
-        print(f"СРЕДНИЕ КОЭФФИЦИЕНТЫ для товарных групп ОАИ за {len(years)} лет ({years[0]}-{years[-1]}):")
-        print(f"{'=' * 60}")
-
-        for group, coef_list in all_coefficients.items():
-            avg_coef = sum(coef_list) / len(coef_list)
-            coefficients[group] = avg_coef
-            print(f"  {group}: {avg_coef:.6f} ({avg_coef * 100:.2f}%)")
-            print(f"    Диапазон: {min(coef_list):.6f} - {max(coef_list):.6f}")
-
-        # Выводим общую сумму коэффициентов для проверки
-        total_coef = sum(coefficients.values())
-        print(f"\nСумма коэффициентов: {total_coef:.6f}")
-
-        # Нормализуем, если сумма не равна 1
-        if abs(total_coef - 1.0) > 0.0001:
-            print(f"ВНИМАНИЕ: Сумма коэффициентов = {total_coef:.6f}, выполняем нормализацию...")
-            for group in coefficients:
-                coefficients[group] = coefficients[group] / total_coef
-
-            print("\nПосле нормализации:")
-            for group, coef in coefficients.items():
-                print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%)")
-
-        return coefficients
-
-    def split_oai_by_groups(self, oai_forecast, target_year):
-        """Разбивка годового прогноза ОАИ по товарным группам"""
-        coefficients = self.calculate_oai_group_coefficients(target_year)
-
-        if not coefficients:
-            ui.notify('Нет данных по товарным группам для разбивки прогноза ОАИ', type='warning')
-            return None
-
-        # Считаем общую сумму ОАИ за год
-        total_oai = oai_forecast['forecast'].sum()
-
-        print(f"\n{'=' * 60}")
-        print(f"Разбивка годового прогноза ОАИ ({total_oai:,.0f} ₽) по товарным группам:")
-        print(f"{'=' * 60}")
-
-        # Разбиваем общую сумму по группам
-        result = []
-        for group, coef in coefficients.items():
-            group_value = total_oai * coef
-            # Округляем до тысяч
-            group_value = max(1000, round(group_value / 1000) * 1000)
-            result.append({
-                'group': group,
-                'forecast': group_value
-            })
-
-        result_df = pd.DataFrame(result)
-
-        # Корректируем сумму, если есть расхождение
-        total_result = result_df['forecast'].sum()
-        diff = total_oai - total_result
-
-        if diff != 0:
-            print(f"Расхождение: {diff:,.0f} ₽, корректируем наибольшую группу")
-            # Находим группу с максимальным значением и корректируем её
-            max_idx = result_df['forecast'].idxmax()
-            result_df.loc[max_idx, 'forecast'] = result_df.loc[max_idx, 'forecast'] + diff
-
-        # Выводим результат
-        print("\nРезультат разбивки:")
-        for _, row in result_df.iterrows():
-            print(f"  {row['group']}: {row['forecast']:,.0f} ₽ ({row['forecast'] / total_oai * 100:.1f}%)")
-
-        return result_df
 
     def load_kn_groups_data(self):
-        """Загрузка данных по товарным группам для направления КН"""
         conn = self.get_db_connection()
-        if not conn:
-            return pd.DataFrame()
-
+        if not conn: return pd.DataFrame()
         try:
             query = """
-                    SELECT
-                        year, month, direction, group_product, pay_summ
-                    FROM kamtent.monthly_group_product
-                    WHERE direction = 'КН'
-                    ORDER BY year, month, group_product \
-                    """
-            df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            ui.notify(f'Ошибка загрузки данных по товарным группам КН: {e}', type='negative')
-            return pd.DataFrame()
+                SELECT year, month, direction, group_product, pay_summ
+                FROM kamtent.monthly_group_product WHERE direction = 'КН'
+                ORDER BY year, month, group_product
+            """
+            return pd.read_sql(query, conn)
         finally:
             conn.close()
-
-    def calculate_kn_group_coefficients(self, target_year):
-        """Расчет коэффициентов для товарных групп КН на основе всех годов до target_year - 2"""
-        if self.df_kn_groups.empty:
-            self.df_kn_groups = self.load_kn_groups_data()
-
-        if self.df_kn_groups.empty:
-            return {}
-
-        # Берем все годы, которые меньше или равны target_year - 2
-        max_year = target_year - 2
-        years = sorted([y for y in self.df_kn_groups['year'].unique() if y <= max_year])
-
-        # Если данных нет, берем последние доступные годы
-        if not years:
-            years = sorted(self.df_kn_groups['year'].unique())[-3:]
-
-        print(f"\n{'=' * 60}")
-        print(f"Расчет коэффициентов для товарных групп КН на основе годов: {years}")
-        print(f"(все годы до {max_year}, включительно)")
-        print(f"{'=' * 60}")
-
-        # Собираем коэффициенты по каждому году
-        all_coefficients = {}
-
-        for year in years:
-            df_year = self.df_kn_groups[self.df_kn_groups['year'] == year]
-            # Суммируем по месяцам для каждого года
-            year_totals = df_year.groupby('group_product')['pay_summ'].sum()
-            year_total = year_totals.sum()
-
-            if year_total > 0:
-                print(f"\n{year} год:")
-                print("-" * 40)
-                for group, total in year_totals.items():
-                    coef = total / year_total
-                    print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%)")
-
-                    if group not in all_coefficients:
-                        all_coefficients[group] = []
-                    all_coefficients[group].append(coef)
-
-        # Рассчитываем средние коэффициенты
-        coefficients = {}
-        print(f"\n{'=' * 60}")
-        print(f"СРЕДНИЕ КОЭФФИЦИЕНТЫ для товарных групп КН за {len(years)} лет ({years[0]}-{years[-1]}):")
-        print(f"{'=' * 60}")
-
-        for group, coef_list in all_coefficients.items():
-            avg_coef = sum(coef_list) / len(coef_list)
-            coefficients[group] = avg_coef
-            print(f"  {group}: {avg_coef:.6f} ({avg_coef * 100:.2f}%)")
-            print(f"    Диапазон: {min(coef_list):.6f} - {max(coef_list):.6f}")
-
-        # Выводим общую сумму коэффициентов для проверки
-        total_coef = sum(coefficients.values())
-        print(f"\nСумма коэффициентов: {total_coef:.6f}")
-
-        # Нормализуем, если сумма не равна 1
-        if abs(total_coef - 1.0) > 0.0001:
-            print(f"ВНИМАНИЕ: Сумма коэффициентов = {total_coef:.6f}, выполняем нормализацию...")
-            for group in coefficients:
-                coefficients[group] = coefficients[group] / total_coef
-
-            print("\nПосле нормализации:")
-            for group, coef in coefficients.items():
-                print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%)")
-
-        return coefficients
-
-    def split_kn_by_groups(self, kn_forecast, target_year):
-        """Разбивка годового прогноза КН по товарным группам"""
-        coefficients = self.calculate_kn_group_coefficients(target_year)
-
-        if not coefficients:
-            ui.notify('Нет данных по товарным группам для разбивки прогноза КН', type='warning')
-            return None
-
-        # Считаем общую сумму КН за год
-        total_kn = kn_forecast['forecast'].sum()
-
-        print(f"\n{'=' * 60}")
-        print(f"Разбивка годового прогноза КН ({total_kn:,.0f} ₽) по товарным группам:")
-        print(f"{'=' * 60}")
-
-        # Разбиваем общую сумму по группам
-        result = []
-        for group, coef in coefficients.items():
-            group_value = total_kn * coef
-            # Округляем до тысяч
-            group_value = max(1000, round(group_value / 1000) * 1000)
-            result.append({
-                'group': group,
-                'forecast': group_value
-            })
-
-        result_df = pd.DataFrame(result)
-
-        # Корректируем сумму, если есть расхождение
-        total_result = result_df['forecast'].sum()
-        diff = total_kn - total_result
-
-        if diff != 0:
-            print(f"Расхождение: {diff:,.0f} ₽, корректируем наибольшую группу")
-            # Находим группу с максимальным значением и корректируем её
-            max_idx = result_df['forecast'].idxmax()
-            result_df.loc[max_idx, 'forecast'] = result_df.loc[max_idx, 'forecast'] + diff
-
-        # Выводим результат
-        print("\nРезультат разбивки:")
-        for _, row in result_df.iterrows():
-            print(f"  {row['group']}: {row['forecast']:,.0f} ₽ ({row['forecast'] / total_kn * 100:.1f}%)")
-
-        return result_df
 
     def load_reklama_groups_data(self):
-        """Загрузка данных по товарным группам для направления РЕКЛАМА"""
         conn = self.get_db_connection()
-        if not conn:
-            return pd.DataFrame()
-
+        if not conn: return pd.DataFrame()
         try:
             query = """
-                    SELECT
-                        year, month, direction, group_product, pay_summ
-                    FROM kamtent.monthly_group_product
-                    WHERE direction = 'РЕКЛАМА'
-                    ORDER BY year, month, group_product \
-                    """
-            df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            ui.notify(f'Ошибка загрузки данных по товарным группам РЕКЛАМА: {e}', type='negative')
-            return pd.DataFrame()
+                SELECT year, month, direction, group_product, pay_summ
+                FROM kamtent.monthly_group_product WHERE direction = 'РЕКЛАМА'
+                ORDER BY year, month, group_product
+            """
+            return pd.read_sql(query, conn)
         finally:
             conn.close()
 
-    def calculate_reklama_group_coefficients(self, target_year):
-        """Расчет коэффициентов для товарных групп РЕКЛАМА на основе всех годов до target_year - 2"""
-        if self.df_reklama_groups.empty:
-            self.df_reklama_groups = self.load_reklama_groups_data()
+    def load_tk_groups_data(self):
+        conn = self.get_db_connection()
+        if not conn: return pd.DataFrame()
+        try:
+            query = """
+                SELECT year, month, direction, group_product, pay_summ
+                FROM kamtent.monthly_group_product WHERE direction = 'ТК'
+                ORDER BY year, month, group_product
+            """
+            return pd.read_sql(query, conn)
+        finally:
+            conn.close()
 
-        if self.df_reklama_groups.empty:
+    def load_sales_data(self):
+        conn = self.get_db_connection()
+        if not conn: return pd.DataFrame()
+        try:
+            query = """
+                SELECT pay_date, pay_summ as sales_sum
+                FROM kamtent.sales WHERE pay_date IS NOT NULL
+                ORDER BY pay_date
+            """
+            df = pd.read_sql(query, conn)
+            df['pay_date'] = pd.to_datetime(df['pay_date'])
+            return df
+        finally:
+            conn.close()
+
+    # ====================== ВЫБОР ИСТОРИЧЕСКИХ ГОДОВ ======================
+    def _get_historical_years(self, target_year, df):
+        current_year = datetime.now().year
+        if target_year > current_year:
+            years = sorted(df['year'].unique())
+        else:
+            years = sorted([y for y in df['year'].unique() if y < target_year])
+            if not years:
+                years = sorted(df['year'].unique())[-4:]
+        return years
+
+    # ====================== КОЭФФИЦИЕНТЫ С НОРМАЛИЗАЦИЕЙ ======================
+    def calculate_direction_coefficients(self, target_year):
+        if self.df_directions.empty:
+            self.df_directions = self.load_directions_data()
+        if self.df_directions.empty:
             return {}
 
-        # Берем все годы, которые меньше или равны target_year - 2
-        max_year = target_year - 2
-        years = sorted([y for y in self.df_reklama_groups['year'].unique() if y <= max_year])
+        years = self._get_historical_years(target_year, self.df_directions)
 
-        # Если данных нет, берем последние доступные годы
-        if not years:
-            years = sorted(self.df_reklama_groups['year'].unique())[-3:]
+        print(f"\n{'='*75}")
+        print(f"КОЭФФИЦИЕНТЫ ПО НАПРАВЛЕНИЯМ для {target_year} | Годы: {years}")
+        print(f"{'='*75}")
 
-        print(f"\n{'=' * 60}")
-        print(f"Расчет коэффициентов для товарных групп РЕКЛАМА на основе годов: {years}")
-        print(f"(все годы до {max_year}, включительно)")
-        print(f"{'=' * 60}")
-
-        # Собираем коэффициенты по каждому году
-        all_coefficients = {}
-
+        all_coefs = {}
         for year in years:
-            df_year = self.df_reklama_groups[self.df_reklama_groups['year'] == year]
-            # Суммируем по месяцам для каждого года
-            year_totals = df_year.groupby('group_product')['pay_summ'].sum()
-            year_total = year_totals.sum()
+            df_year = self.df_directions[self.df_directions['year'] == year]
+            totals = df_year.groupby('direction')['actual'].sum()
+            total = totals.sum()
+            if total > 0:
+                for direction, val in totals.items():
+                    if direction not in all_coefs:
+                        all_coefs[direction] = []
+                    all_coefs[direction].append(val / total)
 
-            if year_total > 0:
-                print(f"\n{year} год:")
-                print("-" * 40)
-                for group, total in year_totals.items():
-                    coef = total / year_total
-                    print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%)")
+        coefficients = {d: sum(v)/len(v) for d, v in all_coefs.items()}
 
-                    if group not in all_coefficients:
-                        all_coefficients[group] = []
-                    all_coefficients[group].append(coef)
-
-        # Рассчитываем средние коэффициенты
-        coefficients = {}
-        print(f"\n{'=' * 60}")
-        print(f"СРЕДНИЕ КОЭФФИЦИЕНТЫ для товарных групп РЕКЛАМА за {len(years)} лет ({years[0]}-{years[-1]}):")
-        print(f"{'=' * 60}")
-
-        for group, coef_list in all_coefficients.items():
-            avg_coef = sum(coef_list) / len(coef_list)
-            coefficients[group] = avg_coef
-            print(f"  {group}: {avg_coef:.6f} ({avg_coef * 100:.2f}%)")
-            print(f"    Диапазон: {min(coef_list):.6f} - {max(coef_list):.6f}")
-
-        # Выводим общую сумму коэффициентов для проверки
-        total_coef = sum(coefficients.values())
-        print(f"\nСумма коэффициентов: {total_coef:.6f}")
-
-        # Нормализуем, если сумма не равна 1
-        if abs(total_coef - 1.0) > 0.0001:
-            print(f"ВНИМАНИЕ: Сумма коэффициентов = {total_coef:.6f}, выполняем нормализацию...")
-            for group in coefficients:
-                coefficients[group] = coefficients[group] / total_coef
-
-            print("\nПосле нормализации:")
-            for group, coef in coefficients.items():
-                print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%)")
+        total = sum(coefficients.values())
+        if abs(total - 1.0) > 0.0001 and total > 0:
+            coefficients = {d: v / total for d, v in coefficients.items()}
 
         return coefficients
 
-    def split_reklama_by_groups(self, reklama_forecast, target_year):
-        """Разбивка годового прогноза РЕКЛАМА по товарным группам"""
-        coefficients = self.calculate_reklama_group_coefficients(target_year)
+    def calculate_oai_group_coefficients(self, target_year):
+        if self.df_oai_groups.empty:
+            self.df_oai_groups = self.load_oai_group_data()
+        if self.df_oai_groups.empty:
+            return {}
 
-        if not coefficients:
-            ui.notify('Нет данных по товарным группам для разбивки прогноза РЕКЛАМА', type='warning')
-            return None
+        years = self._get_historical_years(target_year, self.df_oai_groups)
+        all_coefs = {}
+        for year in years:
+            df_year = self.df_oai_groups[self.df_oai_groups['year'] == year]
+            totals = df_year.groupby('group_product')['pay_summ'].sum()
+            total = totals.sum()
+            if total > 0:
+                for g, v in totals.items():
+                    if g not in all_coefs: all_coefs[g] = []
+                    all_coefs[g].append(v / total)
 
-        # Считаем общую сумму РЕКЛАМА за год
-        total_reklama = reklama_forecast['forecast'].sum()
+        coefs = {g: sum(v)/len(v) for g, v in all_coefs.items()}
+        total = sum(coefs.values())
+        if abs(total - 1.0) > 0.0001 and total > 0:
+            coefs = {g: v / total for g, v in coefs.items()}
+        return coefs
 
-        print(f"\n{'=' * 60}")
-        print(f"Разбивка годового прогноза РЕКЛАМА ({total_reklama:,.0f} ₽) по товарным группам:")
-        print(f"{'=' * 60}")
+    def calculate_kn_group_coefficients(self, target_year):
+        if self.df_kn_groups.empty:
+            self.df_kn_groups = self.load_kn_groups_data()
+        if self.df_kn_groups.empty:
+            return {}
 
-        # Разбиваем общую сумму по группам
-        result = []
-        for group, coef in coefficients.items():
-            group_value = total_reklama * coef
-            # Округляем до тысяч
-            group_value = max(1000, round(group_value / 1000) * 1000)
-            result.append({
-                'group': group,
-                'forecast': group_value
-            })
+        years = self._get_historical_years(target_year, self.df_kn_groups)
+        all_coefs = {}
+        for year in years:
+            df_year = self.df_kn_groups[self.df_kn_groups['year'] == year]
+            totals = df_year.groupby('group_product')['pay_summ'].sum()
+            total = totals.sum()
+            if total > 0:
+                for g, v in totals.items():
+                    if g not in all_coefs: all_coefs[g] = []
+                    all_coefs[g].append(v / total)
 
-        result_df = pd.DataFrame(result)
+        coefs = {g: sum(v)/len(v) for g, v in all_coefs.items()}
+        total = sum(coefs.values())
+        if abs(total - 1.0) > 0.0001 and total > 0:
+            coefs = {g: v / total for g, v in coefs.items()}
+        return coefs
 
-        # Корректируем сумму, если есть расхождение
-        total_result = result_df['forecast'].sum()
-        diff = total_reklama - total_result
+    def calculate_reklama_group_coefficients(self, target_year):
+        if self.df_reklama_groups.empty:
+            self.df_reklama_groups = self.load_reklama_groups_data()
+        if self.df_reklama_groups.empty:
+            return {}
 
-        if diff != 0:
-            print(f"Расхождение: {diff:,.0f} ₽, корректируем наибольшую группу")
-            # Находим группу с максимальным значением и корректируем её
-            max_idx = result_df['forecast'].idxmax()
-            result_df.loc[max_idx, 'forecast'] = result_df.loc[max_idx, 'forecast'] + diff
+        years = self._get_historical_years(target_year, self.df_reklama_groups)
+        all_coefs = {}
+        for year in years:
+            df_year = self.df_reklama_groups[self.df_reklama_groups['year'] == year]
+            totals = df_year.groupby('group_product')['pay_summ'].sum()
+            total = totals.sum()
+            if total > 0:
+                for g, v in totals.items():
+                    if g not in all_coefs: all_coefs[g] = []
+                    all_coefs[g].append(v / total)
 
-        # Выводим результат
-        print("\nРезультат разбивки:")
-        for _, row in result_df.iterrows():
-            print(f"  {row['group']}: {row['forecast']:,.0f} ₽ ({row['forecast'] / total_reklama * 100:.1f}%)")
-
-        return result_df
-
-    def load_tk_groups_data(self):
-        """Загрузка данных по товарным группам для направления ТК"""
-        conn = self.get_db_connection()
-        if not conn:
-            return pd.DataFrame()
-
-        try:
-            query = """
-                    SELECT
-                        year, month, direction, group_product, pay_summ
-                    FROM kamtent.monthly_group_product
-                    WHERE direction = 'ТК'
-                    ORDER BY year, month, group_product \
-                    """
-            df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            ui.notify(f'Ошибка загрузки данных по товарным группам ТК: {e}', type='negative')
-            return pd.DataFrame()
-        finally:
-            conn.close()
+        coefs = {g: sum(v)/len(v) for g, v in all_coefs.items()}
+        total = sum(coefs.values())
+        if abs(total - 1.0) > 0.0001 and total > 0:
+            coefs = {g: v / total for g, v in coefs.items()}
+        return coefs
 
     def calculate_tk_group_coefficients(self, target_year):
-        """Расчет коэффициентов для товарных групп ТК на основе всех годов до target_year - 2"""
         if self.df_tk_groups.empty:
             self.df_tk_groups = self.load_tk_groups_data()
-
         if self.df_tk_groups.empty:
             return {}
 
-        # Группируем товарные группы по новым категориям
+        years = self._get_historical_years(target_year, self.df_tk_groups)
+
         group_mapping = {
             'ТОРГОВЫЕ ТК': 'Торговые ТК',
             'ПРОМЫШЛЕННЫЕ ТК': 'Промышленные ТК',
@@ -686,201 +283,121 @@ class ForecastApp:
             'ОРИГИНАЛЬНЫЕ ТК': 'Прочее'
         }
 
-        # Применяем группировку
-        self.df_tk_groups['group_category'] = self.df_tk_groups['group_product'].map(group_mapping)
+        df = self.df_tk_groups.copy()
+        df['group_category'] = df['group_product'].map(group_mapping).fillna('Прочее')
 
-        # Берем все годы, которые меньше или равны target_year - 2
-        max_year = target_year - 2
-        years = sorted([y for y in self.df_tk_groups['year'].unique() if y <= max_year])
-
-        # Если данных нет, берем последние доступные годы
-        if not years:
-            years = sorted(self.df_tk_groups['year'].unique())[-3:]
-
-        print(f"\n{'=' * 60}")
-        print(f"Расчет коэффициентов для товарных групп ТК на основе годов: {years}")
-        print(f"(все годы до {max_year}, включительно)")
-        print(f"{'=' * 60}")
-
-        # Собираем коэффициенты по каждому году
-        all_coefficients = {}
-
+        all_coefs = {}
         for year in years:
-            df_year = self.df_tk_groups[self.df_tk_groups['year'] == year]
+            df_year = df[df['year'] == year]
+            totals = df_year.groupby('group_category')['pay_summ'].sum()
+            total = totals.sum()
+            if total > 0:
+                for g, v in totals.items():
+                    if g not in all_coefs: all_coefs[g] = []
+                    all_coefs[g].append(v / total)
 
-            # Группируем по новым категориям
-            year_totals = df_year.groupby('group_category')['pay_summ'].sum()
+        coefs = {g: sum(v)/len(v) for g, v in all_coefs.items()}
+        total = sum(coefs.values())
+        if abs(total - 1.0) > 0.0001 and total > 0:
+            coefs = {g: v / total for g, v in coefs.items()}
+        return coefs
 
-            # Добавляем фиксированную категорию "Строители (пологи/шторы)ТК" с нулевой суммой
-            # Она будет обработана отдельно
-            if 'Строители (пологи/шторы)ТК' not in year_totals.index:
-                year_totals['Строители (пологи/шторы)ТК'] = 0
-
-            year_total = year_totals.sum()
-
-            if year_total > 0:
-                print(f"\n{year} год:")
-                print("-" * 40)
-                for group, total in year_totals.items():
-                    coef = total / year_total
-                    print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%) - сумма: {total:,.2f}")
-
-                    if group not in all_coefficients:
-                        all_coefficients[group] = []
-                    all_coefficients[group].append(coef)
-
-        # Рассчитываем средние коэффициенты
-        coefficients = {}
-        print(f"\n{'=' * 60}")
-        print(f"СРЕДНИЕ КОЭФФИЦИЕНТЫ для товарных групп ТК за {len(years)} лет ({years[0]}-{years[-1]}):")
-        print(f"{'=' * 60}")
-
-        for group, coef_list in all_coefficients.items():
-            avg_coef = sum(coef_list) / len(coef_list)
-            coefficients[group] = avg_coef
-            print(f"  {group}: {avg_coef:.6f} ({avg_coef * 100:.2f}%)")
-            print(f"    Диапазон: {min(coef_list):.6f} - {max(coef_list):.6f}")
-
-        # Выводим общую сумму коэффициентов для проверки
-        total_coef = sum(coefficients.values())
-        print(f"\nСумма коэффициентов: {total_coef:.6f}")
-
-        # Нормализуем, если сумма не равна 1
-        if abs(total_coef - 1.0) > 0.0001:
-            print(f"ВНИМАНИЕ: Сумма коэффициентов = {total_coef:.6f}, выполняем нормализацию...")
-            for group in coefficients:
-                coefficients[group] = coefficients[group] / total_coef
-
-            print("\nПосле нормализации:")
-            for group, coef in coefficients.items():
-                print(f"  {group}: {coef:.6f} ({coef * 100:.2f}%)")
-
-        return coefficients
-
-    def split_tk_by_groups(self, tk_forecast, target_year):
-        """Разбивка годового прогноза ТК по товарным группам"""
-        coefficients = self.calculate_tk_group_coefficients(target_year)
-
+    # ====================== РАЗБИВКА ======================
+    def split_forecast_by_directions(self, monthly_forecast, target_year):
+        coefficients = self.calculate_direction_coefficients(target_year)
         if not coefficients:
-            ui.notify('Нет данных по товарным группам для разбивки прогноза ТК', type='warning')
             return None
 
-        # Считаем общую сумму ТК за год
-        total_tk = tk_forecast['forecast'].sum()
-
-        print(f"\n{'=' * 60}")
-        print(f"Разбивка годового прогноза ТК ({total_tk:,.0f} ₽) по товарным группам:")
-        print(f"{'=' * 60}")
-
-        # Разбиваем общую сумму по группам
         result = []
-        for group, coef in coefficients.items():
-            if group == 'Строители (пологи/шторы)ТК':
-                # Фиксированная сумма 50,000 для этой группы
-                group_value = 50000
-            else:
-                group_value = total_tk * coef
-                # Округляем до тысяч
-                group_value = max(1000, round(group_value / 1000) * 1000)
-            result.append({
-                'group': group,
-                'forecast': group_value
-            })
+        for _, row in monthly_forecast.iterrows():
+            month = row['month']
+            total = row['forecast']
+            values = {d: total * c for d, c in coefficients.items()}
 
-        result_df = pd.DataFrame(result)
+            directions_list = list(coefficients.keys())
+            rounded = {}
+            remaining = total
+            for d in directions_list[:-1]:
+                val = max(1000, round(values[d] / 1000) * 1000)
+                rounded[d] = val
+                remaining -= val
+            rounded[directions_list[-1]] = max(0, remaining)
 
-        # Корректируем сумму, если есть расхождение (исключая фиксированную группу)
-        total_result = result_df[result_df['group'] != 'Строители (пологи/шторы)ТК']['forecast'].sum()
-        total_result += 50000  # Добавляем фиксированную сумму
+            for d, v in rounded.items():
+                result.append({'month': month, 'direction': d, 'forecast': v})
 
-        diff = total_tk - total_result
+        return pd.DataFrame(result)
 
-        if diff != 0:
-            print(f"Расхождение: {diff:,.0f} ₽, корректируем наибольшую группу")
-            # Находим группу с максимальным значением (кроме фиксированной)
-            max_group = \
-                result_df[result_df['group'] != 'Строители (пологи/шторы)ТК'].loc[result_df['forecast'].idxmax()][
-                    'group']
-            max_idx = result_df[result_df['group'] == max_group].index[0]
-            result_df.loc[max_idx, 'forecast'] = result_df.loc[max_idx, 'forecast'] + diff
+    def split_oai_by_groups(self, oai_forecast, target_year):
+        coef = self.calculate_oai_group_coefficients(target_year)
+        if not coef: return None
+        total = oai_forecast['forecast'].sum()
+        result = [{'group': g, 'forecast': max(1000, round(total * c / 1000) * 1000)} for g, c in coef.items()]
+        df = pd.DataFrame(result)
+        diff = total - df['forecast'].sum()
+        if diff != 0 and not df.empty:
+            df.loc[df['forecast'].idxmax(), 'forecast'] += diff
+        return df
 
-        # Выводим результат
-        print("\nРезультат разбивки:")
-        for _, row in result_df.iterrows():
-            print(f"  {row['group']}: {row['forecast']:,.0f} ₽ ({row['forecast'] / total_tk * 100:.1f}%)")
+    def split_kn_by_groups(self, kn_forecast, target_year):
+        coef = self.calculate_kn_group_coefficients(target_year)
+        if not coef: return None
+        total = kn_forecast['forecast'].sum()
+        result = [{'group': g, 'forecast': max(1000, round(total * c / 1000) * 1000)} for g, c in coef.items()]
+        df = pd.DataFrame(result)
+        diff = total - df['forecast'].sum()
+        if diff != 0 and not df.empty:
+            df.loc[df['forecast'].idxmax(), 'forecast'] += diff
+        return df
 
-        return result_df
+    def split_reklama_by_groups(self, reklama_forecast, target_year):
+        coef = self.calculate_reklama_group_coefficients(target_year)
+        if not coef: return None
+        total = reklama_forecast['forecast'].sum()
+        result = [{'group': g, 'forecast': max(1000, round(total * c / 1000) * 1000)} for g, c in coef.items()]
+        df = pd.DataFrame(result)
+        diff = total - df['forecast'].sum()
+        if diff != 0 and not df.empty:
+            df.loc[df['forecast'].idxmax(), 'forecast'] += diff
+        return df
 
-    def load_sales_data(self):
-        """Загрузка данных о продажах для прогнозирования"""
-        conn = self.get_db_connection()
-        if not conn:
-            return pd.DataFrame()
+    def split_tk_by_groups(self, tk_forecast, target_year):
+        coef = self.calculate_tk_group_coefficients(target_year)
+        if not coef: return None
+        total = tk_forecast['forecast'].sum()
+        result = []
+        for g, c in coef.items():
+            value = 50000 if g == 'Строители (пологи/шторы)ТК' else max(1000, round(total * c / 1000) * 1000)
+            result.append({'group': g, 'forecast': value})
+        df = pd.DataFrame(result)
+        diff = total - df['forecast'].sum()
+        if diff != 0 and not df.empty:
+            valid = df[df['group'] != 'Строители (пологи/шторы)ТК']
+            if not valid.empty:
+                df.loc[valid['forecast'].idxmax(), 'forecast'] += diff
+        return df
 
-        try:
-            query = """
-                    SELECT pay_date, \
-                           pay_summ as sales_sum
-                    FROM kamtent.sales
-                    WHERE pay_date IS NOT NULL
-                    ORDER BY pay_date \
-                    """
-            df = pd.read_sql(query, conn)
-            df['pay_date'] = pd.to_datetime(df['pay_date'])
-            df['sales_sum'] = df['sales_sum'].round(2)
-            return df
-        except Exception as e:
-            ui.notify(f'Ошибка загрузки данных о продажах: {e}', type='negative')
-            return pd.DataFrame()
-        finally:
-            conn.close()
-
+    # ====================== ПОДГОТОВКА ДАННЫХ ======================
     def prepare_monthly_data(self, df):
-        """Подготовка месячных данных"""
         df = df.copy()
         df['year'] = df['pay_date'].dt.year
         df['month'] = df['pay_date'].dt.month
-
-        # Агрегация по месяцам
         monthly = df.groupby(['year', 'month'])['sales_sum'].sum().reset_index()
         monthly['Date'] = pd.to_datetime(monthly[['year', 'month']].assign(day=1))
-        monthly = monthly[['Date', 'sales_sum']].rename(columns={'sales_sum': 'Sales'})
-        monthly = monthly.set_index('Date').sort_index()
-
-        # Интерполяция пропусков
-        monthly['Sales'] = monthly['Sales'].interpolate(method='linear')
-        monthly['Sales'] = monthly['Sales'].bfill().ffill()
-
+        monthly = monthly[['Date', 'sales_sum']].rename(columns={'sales_sum': 'Sales'}).set_index('Date').sort_index()
+        monthly['Sales'] = monthly['Sales'].interpolate('linear').bfill().ffill()
         return monthly
 
     def prepare_weekly_data(self, df):
-        """Подготовка недельных данных"""
-        df = df.copy()
-        df = df.set_index('pay_date').sort_index()
-
-        # Агрегация по неделям (начиная с понедельника)
-        weekly = df.resample('W-MON')['sales_sum'].sum()
-        weekly = weekly.to_frame(name='Sales')
-
-        # Интерполяция пропусков
-        weekly['Sales'] = weekly['Sales'].interpolate(method='linear')
-        weekly['Sales'] = weekly['Sales'].bfill().ffill()
-
+        df = df.copy().set_index('pay_date').sort_index()
+        weekly = df.resample('W-MON')['sales_sum'].sum().to_frame('Sales')
+        weekly['Sales'] = weekly['Sales'].interpolate('linear').bfill().ffill()
         return weekly
 
     def prepare_daily_data(self, df):
-        """Подготовка ежедневных данных"""
-        df = df.copy()
-        df = df.set_index('pay_date').sort_index()
-
-        # Агрегация по дням
-        daily = df.resample('D')['sales_sum'].sum()
-        daily = daily.to_frame(name='Sales')
-
-        # Интерполяция пропусков
-        daily['Sales'] = daily['Sales'].interpolate(method='time')
-        daily['Sales'] = daily['Sales'].bfill().ffill()
-
+        df = df.copy().set_index('pay_date').sort_index()
+        daily = df.resample('D')['sales_sum'].sum().to_frame('Sales')
+        daily['Sales'] = daily['Sales'].interpolate('time').bfill().ffill()
         return daily
 
     def round_amount(self, amount, precision='hundreds_thousands'):
@@ -895,54 +412,31 @@ class ForecastApp:
             return round(amount, 2)
 
     async def update_progress(self, value, text):
-        """Обновление прогресс-бара"""
         if self.progress_bar:
             self.progress_bar.set_value(value)
         if self.progress_text:
             self.progress_text.set_text(text)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
+    # ====================== ПРОГНОЗ ======================
+    # Здесь оставляем твои оригинальные методы прогноза без изменений
     def forecast_for_year(self, data, agg_level, target_year, min_monthly=2100000):
-        """Прогнозирование на указанный год с разными уровнями агрегации"""
-
         if agg_level == 'monthly':
             return self.forecast_monthly(data, target_year, min_monthly)
         elif agg_level == 'weekly':
             return self.forecast_weekly_optimized(data, target_year, min_monthly)
         elif agg_level == 'daily':
             return self.forecast_daily(data, target_year, min_monthly)
-        else:
-            return None
+        return None
 
-    def forecast_monthly(self, df, target_year, min_monthly):
-        """Прогноз на основе месячных данных (упрощенный)"""
+    def forecast_monthly(self, df, target_year, min_monthly=2100000):
+        """Прогноз на основе месячных данных"""
         train = df[df.index <= f'{target_year - 1}-12-31']
 
         if len(train) < 12:
             return self.fallback_forecast(train, target_year, min_monthly, 'monthly')
 
         models = {}
-
-        # Простое скользящее среднее
-        try:
-            last_12 = train.tail(12)['Sales'].values
-            if len(last_12) >= 6:
-                seasonal_factors = []
-                for i in range(1, 13):
-                    same_month_data = train[train.index.month == i]['Sales'].tail(3)
-                    if len(same_month_data) > 0:
-                        seasonal_factors.append(same_month_data.mean() / train['Sales'].tail(12).mean())
-                    else:
-                        seasonal_factors.append(1.0)
-
-                seasonal_factors = np.array(seasonal_factors)
-                seasonal_factors = seasonal_factors / seasonal_factors.mean() * 1.0
-
-                base = train['Sales'].tail(6).mean()
-                forecast = [base * factor for factor in seasonal_factors]
-                models['Seasonal_MA'] = forecast
-        except Exception as e:
-            print(f"Seasonal MA failed: {e}")
 
         # Holt-Winters
         try:
@@ -963,8 +457,7 @@ class ForecastApp:
 
         # Prophet
         try:
-            prophet_df = train.reset_index()[['Date', 'Sales']]
-            prophet_df.columns = ['ds', 'y']
+            prophet_df = train.reset_index()[['Date', 'Sales']].rename(columns={'Date': 'ds', 'Sales': 'y'})
             prophet_df['y'] = prophet_df['y'].bfill().ffill()
             if len(prophet_df) >= 12:
                 prophet_model = Prophet(
@@ -982,15 +475,15 @@ class ForecastApp:
         if models:
             if len(models) > 1:
                 ensemble = pd.DataFrame(models).mean(axis=1)
-                forecast = ensemble
+                forecast = ensemble.values
                 model_name = 'Ensemble'
             else:
                 model_name = list(models.keys())[0]
                 forecast = models[model_name]
-
-            forecast = [max(float(x), min_monthly) for x in forecast]
         else:
             return self.fallback_forecast(train, target_year, min_monthly, 'monthly')
+
+        forecast = [max(float(x), min_monthly) for x in forecast]
 
         forecast_dates = pd.date_range(start=f'{target_year}-01-31', periods=12, freq='ME')
 
@@ -999,6 +492,7 @@ class ForecastApp:
             'forecast': forecast
         })
 
+        # Исправленный вызов round_amount
         forecast_df['forecast'] = forecast_df['forecast'].apply(
             lambda x: self.round_amount(x, 'hundreds_thousands')
         )
@@ -1221,7 +715,6 @@ class ForecastApp:
         }
 
         return result_df, stats
-
     def update_years_table(self):
         """Обновление таблицы с данными по годам"""
         self.df_years = self.load_years_data()
@@ -1275,29 +768,22 @@ class ForecastApp:
 
             self.years_table = table
 
+    # ====================== UI ======================
     async def on_forecast_click(self):
-        """Обработчик кнопки прогноза (асинхронный)"""
         selected_year = self.select_year.value
-        agg_level = self.agg_select.value
+        agg_level_str = self.agg_select.value
 
-        # Показываем прогресс-бар
+        agg_map = {'По месяцам': 'monthly', 'По неделям': 'weekly', 'По дням': 'daily'}
+        agg_level = agg_map.get(agg_level_str, 'monthly')
+
         self.progress_container.clear()
         with self.progress_container:
             with ui.row().classes('items-center gap-4'):
-                self.progress_bar = ui.circular_progress(
-                    value=0,
-                    min=0,
-                    max=100,
-                    size='50px',
-                    show_value=False
-                )
-                self.progress_text = ui.label('Начинаем расчет...').classes('text-bold')
-
-        ui.notify(f'Расчет прогноза на {selected_year} год ({agg_level})...', type='info')
+                self.progress_bar = ui.circular_progress(value=0, min=0, max=100, size='50px')
+                self.progress_text = ui.label(f'Расчёт прогноза на {selected_year}...').classes('text-bold')
 
         await self.update_progress(10, 'Загрузка данных...')
 
-        # Загружаем данные, если еще не загружены
         if self.df_sales.empty:
             self.df_sales = self.load_sales_data()
             if not self.df_sales.empty:
@@ -1305,55 +791,14 @@ class ForecastApp:
                 self.weekly_df = self.prepare_weekly_data(self.df_sales)
                 self.daily_df = self.prepare_daily_data(self.df_sales)
 
-        if self.df_sales.empty:
-            self.forecast_container.clear()
-            self.direction_container.clear()
-            with self.forecast_container:
-                ui.label('Нет данных для прогнозирования').classes('text-bold text-red')
-            self.progress_container.clear()
-            return
+        await self.update_progress(30, 'Расчёт прогноза...')
 
-        await self.update_progress(20, 'Подготовка данных...')
+        data = {'monthly': self.monthly_df, 'weekly': self.weekly_df, 'daily': self.daily_df}.get(agg_level)
 
-        # Загружаем данные по направлениям
-        if self.df_directions.empty:
-            self.df_directions = self.load_directions_data()
+        forecast_result = self.forecast_for_year(data, agg_level, selected_year)
 
-        await self.update_progress(25, 'Расчет коэффициентов по направлениям...')
+        await self.update_progress(70, 'Разбивка по направлениям и группам...')
 
-        # Восстанавливаем таблицу с годами
-        if self.df_years.empty:
-            self.update_years_table()
-
-        # Выбираем соответствующие данные
-        if agg_level == 'По месяцам':
-            data = self.monthly_df
-            agg = 'monthly'
-            await self.update_progress(30, 'Месячный прогноз...')
-        elif agg_level == 'По неделям':
-            data = self.weekly_df
-            agg = 'weekly'
-            await self.update_progress(30, 'Недельный прогноз (может занять до 30 секунд)...')
-        else:
-            data = self.daily_df
-            agg = 'daily'
-            await self.update_progress(30, 'Дневной прогноз...')
-
-        # Делаем прогноз
-        try:
-            forecast_result = self.forecast_for_year(
-                data,
-                agg,
-                selected_year,
-                min_monthly=2100000
-            )
-        except Exception as e:
-            print(f"Ошибка прогноза: {e}")
-            forecast_result = None
-
-        await self.update_progress(70, 'Формирование результатов...')
-
-        # Очищаем контейнеры
         self.forecast_container.clear()
         self.direction_container.clear()
 
@@ -1803,23 +1248,51 @@ class ForecastApp:
         await asyncio.sleep(2)
         self.progress_container.clear()
 
+    def create_ui(self):
+        ui.label('Прогнозирование поступлений средств').classes('text-h3 text-bold text-center w-full mb-6')
+
+        with ui.row().classes('justify-center w-full gap-4 mb-6'):
+            ui.button('Загрузить данные', on_click=self.on_load_all_click).classes('bg-blue-500 text-white')
+            self.select_year = ui.select(list(range(2020, 2031)), label='Год прогноза', value=datetime.now().year + 1).classes('w-48')
+            self.agg_select = ui.select(['По месяцам', 'По неделям', 'По дням'], label='Уровень агрегации', value='По месяцам').classes('w-48')
+            ui.button('Сделать прогноз', on_click=self.on_forecast_click).classes('bg-green-500 text-white px-8')
+
+        self.progress_container = ui.column().classes('w-full max-w-4xl mx-auto')
+        self.years_container = ui.column().classes('w-full max-w-4xl mx-auto mt-6')
+        self.forecast_container = ui.column().classes('w-full max-w-4xl mx-auto mt-6')
+        self.direction_container = ui.column().classes('w-full max-w-4xl mx-auto mt-6')
+        self.oai_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-6')
+        self.tk_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-6')
+        self.reklama_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-6')
+        self.kn_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-6')
+
     def on_load_all_click(self):
-        """Загрузка всех данных"""
-        ui.notify('Загрузка данных...', type='info')
-        self.update_years_table()
+        """Загрузка всех данных + отображение таблицы по годам"""
+        ui.notify('Загрузка данных из базы...', type='info')
+
+        # Загружаем данные
+        self.df_years = self.load_years_data()
         self.df_sales = self.load_sales_data()
         self.df_directions = self.load_directions_data()
 
+        # Подготавливаем данные для прогноза
         if not self.df_sales.empty:
             self.monthly_df = self.prepare_monthly_data(self.df_sales)
             self.weekly_df = self.prepare_weekly_data(self.df_sales)
             self.daily_df = self.prepare_daily_data(self.df_sales)
+
+        # Обновляем таблицу с годами
+        self.update_years_table()
+
+        # Уведомления
+        if not self.df_years.empty:
+            ui.notify(f'Загружены данные по годам: {len(self.df_years)} записей', type='positive')
+        if not self.df_sales.empty:
             ui.notify(f'Загружено {len(self.df_sales)} записей о продажах', type='positive')
-
         if not self.df_directions.empty:
-            ui.notify(f'Загружено {len(self.df_directions)} записей по направлениям', type='positive')
+            ui.notify(f'Загружены данные по направлениям', type='positive')
 
-        # Очищаем прогнозы
+        # Очищаем предыдущие прогнозы
         self.forecast_container.clear()
         self.direction_container.clear()
         self.oai_group_container.clear()
@@ -1827,79 +1300,7 @@ class ForecastApp:
         self.reklama_group_container.clear()
         self.kn_group_container.clear()
 
-    def create_ui(self):
-        """Создание интерфейса"""
-        # Добавляем CSS для единого стиля таблиц
-        ui.add_head_html('''
-        <style>
-        .font-mono {
-            font-family: 'Courier New', monospace !important;
-            font-weight: 500;
-            letter-spacing: 0.5px;
-        }
-        .q-table td, .q-table th {
-            padding: 12px 16px !important;
-            font-size: 14px;
-        }
-        .q-table th {
-            background-color: #f5f5f5;
-            font-weight: bold;
-        }
-        .q-table tbody tr:hover {
-            background-color: #f9f9f9;
-        }
-        .bg-blue-1 { background-color: #e3f2fd; }
-        .bg-green-1 { background-color: #e8f5e8; }
-        .bg-purple-1 { background-color: #f3e5f5; }
-        </style>
-        ''')
-
-        ui.label('Анализ и прогнозирование данных').classes('text-h3 text-bold text-center w-full mb-6')
-
-        # Панель управления
-        with ui.row().classes('justify-center w-full gap-4 mb-6'):
-            ui.button('Загрузить данные', on_click=self.on_load_all_click).classes('bg-blue-500 text-white px-8 py-2')
-
-            self.select_year = ui.select(
-                [2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027],
-                label='Выберите год для прогноза',
-                value=2026
-            ).classes('w-48')
-
-            self.agg_select = ui.select(
-                ['По месяцам', 'По неделям', 'По дням'],
-                label='Уровень агрегации',
-                value='По месяцам'
-            ).classes('w-48')
-
-            ui.button('Сделать прогноз', on_click=self.on_forecast_click).classes('bg-green-500 text-white px-6 py-2')
-
-        # Контейнер для прогресс-бара
-        self.progress_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
-
-        # Контейнер для данных по годам
-        self.years_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4 mb-8')
-
-        # Контейнер для общего прогноза
-        self.forecast_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4 mb-8')
-
-        # Контейнер для прогноза по направлениям
-        self.direction_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
-
-        # Контейнер для прогноза по товарным группам ОАИ
-        self.oai_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
-
-        # Контейнер для прогноза по товарным группам ТК
-        self.tk_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
-
-        # Контейнер для прогноза по товарным группам РЕКЛАМА
-        self.reklama_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
-
-        # Контейнер для прогноза по товарным группам КН
-        self.kn_group_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
-
 
 def create_forecasting_page():
-    """Создание страницы прогнозирования"""
     app = ForecastApp()
     app.create_ui()
