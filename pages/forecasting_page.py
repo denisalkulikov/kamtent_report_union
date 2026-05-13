@@ -1030,7 +1030,7 @@ class ForecastApp:
 
                     if kn_groups_forecast is not None and not kn_groups_forecast.empty:
                         with self.kn_group_container:
-                            ui.label('ПРОГНОЗ ПО ТОВАРНЫМ ГРУППАМ КН:').classes('text-h5 text-bold text-purple mb-4')
+                            ui.label('ПРОГНОЗ ПО ТОВАРНЫМ ГРУППАМ КН:').classes('text-h5 text-bold text-blue mb-4')
 
                             # Получаем уникальные группы
                             kn_groups = sorted(kn_groups_forecast['group'].unique())
