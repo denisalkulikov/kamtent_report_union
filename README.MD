@@ -153,19 +153,19 @@ JENKINS_JOB_NAME=your_job_name
 ## 🗂️ Структура проекта
 ```
 kamtent_report_union/
-├── main.py                 # Главный файл, объединяющий все модули
-├── pages/                  # Страницы приложения
+├── main.py                      # Главный файл, объединяющий все модули
+├── pages/                       # Страницы приложения
 |   |── init.py                  # Делает папку pages Python-пакетом
 │   ├── jenkins_advanced.py      # Управление Jenkins
 │   ├── excel_parser_page.py     # Парсер Excel
 │   ├── forecasting_page.py      # Прогнозирование
 │   └── monthly_report_page.py   # Ежемесячный отчет
-├── .env                    # Переменные окружения
-├── .gitignore # Игнорируемые файлы для Git
-├── pyproject.toml          # Зависимости проекта
-├── uv.lock                 # Lock-файл зависимостей (фиксирует версии)
-├── LICENSE                 # Лицензия MIT
-└── README.md               # Документация
+├── .env                         # Переменные окружения
+├── .gitignore                   # Игнорируемые файлы для Git
+├── pyproject.toml               # Зависимости проекта
+├── uv.lock                      # Lock-файл зависимостей (фиксирует версии)
+├── LICENSE                      # Лицензия MIT
+└── README.md                    # Документация
 ```
 
 ---
@@ -221,7 +221,7 @@ ui.run(reload=False)
 ---
 
 ## 📝 Лицензия
-MIT License
+MIT [License](https://github.com/denisalkulikov/kamtent_report_union/blob/master/LICENSE)
 
 ---
 
